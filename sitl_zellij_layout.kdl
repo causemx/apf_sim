@@ -1,0 +1,24 @@
+layout {
+    pane split_direction="vertical" {
+        pane {
+            command "bash"
+            args "-c" "cd mav1 && sim_vehicle.py -v ArduCopter -I 0 --sysid 1 -L ITRI --out 172.21.128.1:14550 --out 172.21.128.1:14551"
+        }
+        pane {
+            command "bash"
+            args "-c" "sleep 1 && cd mav2 && sim_vehicle.py -v ArduCopter -I 1 --sysid 2 -L ITRI --out 172.21.128.1:14560 --out 172.21.128.1:14561"
+        }
+        pane {
+            command "bash"
+            args "-c" "sleep 2 && cd mav3 && sim_vehicle.py -v ArduCopter -I 2 --sysid 3 -L ITRI --out 172.21.128.1:14570 --out 172.21.128.1:14571"
+        }
+        pane {
+            command "bash"
+            args "-c" "sleep 3 && cd mav4 && sim_vehicle.py -v ArduCopter -I 3 --sysid 4 -L ITRI --out 172.21.128.1:14580 --out 172.21.128.1:14581"
+        }
+        pane {
+            command "bash"
+            args "-c" "sleep 4 && cd mav5 && sim_vehicle.py -v ArduCopter -I 4 --sysid 5 -L ITRI --out 172.21.128.1:14590 --out 172.21.128.1:14591"
+        }
+    }
+}
