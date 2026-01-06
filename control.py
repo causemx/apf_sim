@@ -340,23 +340,7 @@ class DroneNode:
             return False
 
         # Create arm command message
-        arm_message = dialect.MAVLink_command_long_message(
-            target_system=self.drone.target_system,
-            target_component=self.drone.target_component,
-            command=dialect.MAV_CMD_COMPONENT_ARM_DISARM,
-            confirmation=0,
-            param1=1,  # 1 to arm
-            param2=0,
-            param3=0,
-            param4=0,
-            param5=0,
-            param6=0,
-            param7=0
-        )
-
-        # Send the arm message
-        self.drone.mav.send(arm_message)
-        logger.info("Arm the vehicle")
+        self.arm()
         time.sleep(1)
 
         # Create takeoff command message

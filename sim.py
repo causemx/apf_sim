@@ -8,15 +8,23 @@ import math
 import time
 import cmd
 import os
+import socket
+import threading
 from control import DroneNode, FlightMode
 from loguru import logger
+from dotenv import load_dotenv
+from util import haversine_distance, calculate_bearing, destination_point
 
 
+load_dotenv()
+
+# Listening the target position
+HOST = "0.0.0.0"
+PORT = 65432
 
 ITERATION = 50
 UPDATE_INTERVAL = 1.0
 PRINT_INTERVAL = 5
-
 
 
 class APFDroneSwarm:
@@ -50,6 +58,111 @@ class APFDroneSwarm:
             self.drones.append(drone)
             self.velocities.append({'vx': 0.0, 'vy': 0.0})
             logger.info(f"Created DroneNode {i} with connection: {conn_str}")
+
+        self._stop_server = False
+        self.target_server_t = threading.Thread(target=self.target_position_server_thread)
+        # FIX 1: Make server thread a daemon so it doesn't block program exit
+        self.target_server_t.daemon = True
+        self.target_server_t.start()
+
+    def verify_target_data(self, data_str: str) -> bool:
+        try:
+            if ',' in data_str:
+                lat_str, lon_str = data_str.split(',')
+            else:
+                parts = data_str.split()
+                if len(parts) != 2:
+                    print(f"Invalid data format: {data_str}. Expected: 'latitude,longitude' or 'latitude longitude'")
+                    return False
+                lat_str, lon_str = parts
+                # Parse and validate coordinates
+                lat = float(lat_str.strip())
+                lon = float(lon_str.strip())
+                
+                # Validate latitude range: -90 to 90
+                if not (-90 <= lat <= 90):
+                    logger.error(f"Invalid latitude: {lat}. Must be between -90 and 90")
+                    return False
+                
+                # Validate longitude range: -180 to 180
+                if not (-180 <= lon <= 180):
+                    logger.error(f"Invalid longitude: {lon}. Must be between -180 and 180")
+                    return False
+                
+                # Update target position
+                self.target_pos = (lat, lon)
+                logger.success(f"Target position updated to: ({lat:.6f}, {lon:.6f})")
+                return True
+        except ValueError as e:
+            logger.error(f"Failed to parse coordinates: {data_str}. Error: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error while parsing target data: {str(e)}")
+            return False
+
+
+    def target_position_server_thread(self):
+        """
+        Handles the server-side logic for receiving target position updates.
+        
+        FIX 2: Added socket timeouts and stop flag checking to prevent indefinite blocking.
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                # Allow quick restart of the server
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((HOST, PORT))
+                s.listen(1)
+                # FIX 2a: Set timeout on accept() to avoid indefinite blocking
+                s.settimeout(1.0)  # 1 second timeout
+                logger.info(f"Server listening on {HOST}:{PORT}")
+                
+                conn = None
+                try:
+                    while not self._stop_server:
+                        try:
+                            # accept() will raise socket.timeout after 1 second
+                            conn, addr = s.accept()
+                            logger.info(f"Connected by {addr}")
+                            break
+                        except socket.timeout:
+                            # Timeout occurred, loop will check _stop_server and try again
+                            continue
+                    
+                    # If we exited the loop due to _stop_server flag, exit function
+                    if self._stop_server or conn is None:
+                        logger.info("Server shutdown requested")
+                        return
+                    
+                    # Connection established, now receive data
+                    with conn:
+                        # FIX 2b: Set timeout on recv() as well
+                        conn.settimeout(1.0)
+                        while not self._stop_server:
+                            try:
+                                data = conn.recv(1024)
+                                if data:
+                                    logger.info(f"Server received: {data.decode()}")
+                                    self.verify_target_data(data)
+                                else:
+                                    # Empty data means client closed connection
+                                    logger.info("Client closed connection")
+                                    break
+                            except socket.timeout:
+                                # Timeout on recv, check stop flag and continue
+                                continue
+                except Exception as e:
+                    logger.error(f"Error in server accept/receive: {str(e)}")
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except:
+                            pass
+                            
+        except Exception as e:
+            logger.error(f"Server thread error: {str(e)}")
+
     
     def connect_all(self):
         """Connect to all drones"""
@@ -186,192 +299,214 @@ class APFDroneSwarm:
                 continue
             
             other_lat, other_lon = other_pos
+            
             distance = haversine_distance(drone_lat, drone_lon, other_lat, other_lon)
             
-            if distance < 0.1:  # Avoid division by zero
-                distance = 0.1
-            
-            # Only repel if too close
-            if distance < self.min_inter_drone_distance * 2:
+            # Only calculate repulsion if drones are within repulsion range
+            if distance > self.min_inter_drone_distance and distance < 100:  # 100m max range
+                # Repulsion magnitude increases as drones get closer
                 force_magnitude = self.inter_node_repulsion / (distance**2)
                 
                 # Calculate bearing from other drone to this drone (repulsion direction)
                 bearing = calculate_bearing(other_lat, other_lon, drone_lat, drone_lon)
                 
+                # Convert to lat/lon components
                 force_lat_total += force_magnitude * math.cos(bearing)
                 force_lon_total += force_magnitude * math.sin(bearing)
         
         return force_lat_total, force_lon_total
     
-    def update_drone_positions(self):
-        """Update all drone positions based on APF forces"""
-        for i, drone in enumerate(self.drones):
-            pos = self.get_drone_position(i)
-            if pos is None:
-                logger.warning(f"Drone {i} position unavailable, skipping update")
-                continue
-            
-            drone_lat, drone_lon = pos
-            
-            # Calculate all forces
-            rep_lat, rep_lon = self.calculate_repulsion_from_target(i)
-            att_lat, att_lon = self.calculate_attraction_to_circle(i)
-            inter_lat, inter_lon = self.calculate_inter_drone_repulsion(i)
-            
-            # Sum all forces (in m/s equivalent)
-            total_force_lat = rep_lat + att_lat + inter_lat
-            total_force_lon = rep_lon + att_lon + inter_lon
-            
-            # Update velocity
-            self.velocities[i]['vx'] += total_force_lat * 0.1
-            self.velocities[i]['vy'] += total_force_lon * 0.1
-            
-            # Apply damping
-            self.velocities[i]['vx'] *= self.damping
-            self.velocities[i]['vy'] *= self.damping
-            
-            # Limit maximum speed
-            speed = math.sqrt(self.velocities[i]['vx']**2 + self.velocities[i]['vy']**2)
-            if speed > self.max_speed:
-                self.velocities[i]['vx'] = (self.velocities[i]['vx'] / speed) * self.max_speed
-                self.velocities[i]['vy'] = (self.velocities[i]['vy'] / speed) * self.max_speed
-            
-            # Calculate new position based on velocity
-            # Convert velocity (m/s) to displacement (m) over update interval
-            update_interval = 1.0  # seconds
-            displacement = speed * update_interval
-            
-            if displacement > 0.1:  # Only move if displacement is significant
-                # Calculate bearing from velocity components
-                bearing = math.atan2(self.velocities[i]['vy'], self.velocities[i]['vx'])
+    def update_drone_velocity(self, drone_index, fx_total, fy_total):
+        """
+        Update drone velocity based on forces using physics simulation
+        
+        Args:
+            drone_index: Index of the drone
+            fx_total: Total force in latitude direction
+            fy_total: Total force in longitude direction
+        """
+        # Get current velocity
+        vx = self.velocities[drone_index]['vx']
+        vy = self.velocities[drone_index]['vy']
+        
+        # Apply damping (friction)
+        vx *= self.damping
+        vy *= self.damping
+        
+        # Apply forces (treat as acceleration for this iteration)
+        vx += fx_total
+        vy += fy_total
+        
+        # Limit speed
+        speed = math.sqrt(vx**2 + vy**2)
+        if speed > self.max_speed:
+            scaling_factor = self.max_speed / speed
+            vx *= scaling_factor
+            vy *= scaling_factor
+        
+        # Store updated velocity
+        self.velocities[drone_index]['vx'] = vx
+        self.velocities[drone_index]['vy'] = vy
+    
+    def update_drone_position(self, drone_index):
+        """
+        Update drone position based on velocity
+        
+        Args:
+            drone_index: Index of the drone to update
+        """
+        drone = self.drones[drone_index]
+        pos = self.get_drone_position(drone_index)
+        
+        if pos is None:
+            return
+        
+        lat, lon = pos
+        vx = self.velocities[drone_index]['vx']
+        vy = self.velocities[drone_index]['vy']
+        
+        # Calculate new position
+        # Simplified: treat velocity components as degree/s changes
+        new_lat = lat + vx * 0.00001  # Scale down for realistic movement
+        new_lon = lon + vy * 0.00001
+        
+        # Send fly_to command to drone
+        drone.fly_to_target(new_lat, new_lon, self.altitude)
+    
+    def run(self, iterations=ITERATION, update_interval=UPDATE_INTERVAL, print_interval=PRINT_INTERVAL, verbose=False):
+        """
+        Run APF simulation for specified iterations
+        
+        Args:
+            iterations: Number of iterations to run (use float('inf') for continuous)
+            update_interval: Time between updates in seconds
+            print_interval: Iterations between status prints
+            verbose: Whether to print status each iteration
+        """
+        iteration = 0
+        last_print = 0
+        
+        try:
+            while iteration < iterations:
+                # Calculate forces for each drone
+                for i in range(len(self.drones)):
+                    # Calculate all forces
+                    fx_repulsion, fy_repulsion = self.calculate_repulsion_from_target(i)
+                    fx_attraction, fy_attraction = self.calculate_attraction_to_circle(i)
+                    fx_inter, fy_inter = self.calculate_inter_drone_repulsion(i)
+                    
+                    # Sum all forces
+                    fx_total = fx_repulsion + fx_attraction + fx_inter
+                    fy_total = fy_repulsion + fy_attraction + fy_inter
+                    
+                    # Update velocity and position
+                    self.update_drone_velocity(i, fx_total, fy_total)
+                    self.update_drone_position(i)
                 
-                # Calculate new position
-                new_lat, new_lon = destination_point(drone_lat, drone_lon, bearing, displacement)
+                # Print status periodically
+                if verbose and iteration - last_print >= print_interval:
+                    stats = self.get_swarm_statistics()
+                    logger.info(f"Iteration {iteration}: Center=({stats['center_lat']:.6f}, {stats['center_lon']:.6f}), "
+                               f"Avg Distance={stats.get('avg_distance_to_target', 0):.2f}m")
+                    last_print = iteration
                 
-                # Command drone to fly to new position
-                logger.info(f"Drone {i}: Moving to ({new_lat:.6f}, {new_lon:.6f}), "
-                           f"displacement: {displacement:.2f}m")
-                drone.fly_to_target(new_lat, new_lon, self.altitude)
-            else:
-                logger.debug(f"Drone {i}: Minimal displacement ({displacement:.3f}m), holding position")
+                # Sleep for specified interval
+                time.sleep(update_interval)
+                iteration += 1
+                
+        except KeyboardInterrupt:
+            logger.info("APF simulation interrupted by user")
+            raise
     
     def get_swarm_statistics(self):
-        """Calculate and return swarm statistics"""
-        if not self.drones:
-            return {}
+        """
+        Calculate and return swarm statistics
         
+        Returns:
+            dict: Dictionary containing swarm statistics
+        """
         positions = []
+        distances_to_target = []
+        velocities = []
+        
         for i in range(len(self.drones)):
             pos = self.get_drone_position(i)
             if pos:
                 positions.append(pos)
-        
-        if not positions:
-            return {'num_drones': len(self.drones), 'positions_available': 0}
-        
-        # Calculate center of mass
-        center_lat = sum(p[0] for p in positions) / len(positions)
-        center_lon = sum(p[1] for p in positions) / len(positions)
-        
-        # Calculate average distance from target
-        if self.target_pos:
-            distances = [haversine_distance(p[0], p[1], self.target_pos[0], self.target_pos[1]) 
-                        for p in positions]
-            avg_distance = sum(distances) / len(distances)
-            min_distance = min(distances)
-            max_distance = max(distances)
-        else:
-            avg_distance = min_distance = max_distance = 0
-        
-        # Calculate average velocity
-        avg_velocity = sum(
-            math.sqrt(v['vx']**2 + v['vy']**2) 
-            for v in self.velocities
-        ) / len(self.velocities)
-        
-        return {
-            'center_lat': center_lat,
-            'center_lon': center_lon,
-            'avg_distance_to_target': avg_distance,
-            'min_distance_to_target': min_distance,
-            'max_distance_to_target': max_distance,
-            'avg_velocity': avg_velocity,
-            'num_drones': len(self.drones),
-            'positions_available': len(positions)
-        }
-    
-    def print_state(self, iteration):
-        """Print current simulation state to console"""
-        stats = self.get_swarm_statistics()
-        print(f"\n{'='*70}")
-        print(f"Iteration: {iteration}")
-        print(f"{'='*70}")
-        print(f"Target Position: ({self.target_pos[0]:.6f}, {self.target_pos[1]:.6f})")
-        print(f"Target Radius: {self.target_radius}m")
-        print(f"Swarm Center: ({stats.get('center_lat', 0):.6f}, {stats.get('center_lon', 0):.6f})")
-        print(f"Number of Drones: {stats['num_drones']} (positions available: {stats['positions_available']})")
-        print(f"Avg Distance to Target: {stats.get('avg_distance_to_target', 0):.2f}m")
-        print(f"Min/Max Distance: {stats.get('min_distance_to_target', 0):.2f}m / {stats.get('max_distance_to_target', 0):.2f}m")
-        print(f"Avg Velocity: {stats.get('avg_velocity', 0):.2f} m/s")
-        print("\nDrone Positions:")
-        print(f"{'ID':<4} {'Latitude':<14} {'Longitude':<14} {'Distance(m)':<12} {'Speed(m/s)':<10}")
-        print(f"{'-'*70}")
-        
-        for i, drone in enumerate(self.drones):
-            pos = self.get_drone_position(i)
-            if pos:
+                
+                # Calculate distance to target
                 if self.target_pos:
                     dist = haversine_distance(pos[0], pos[1], self.target_pos[0], self.target_pos[1])
-                else:
-                    dist = 0
-                speed = math.sqrt(self.velocities[i]['vx']**2 + self.velocities[i]['vy']**2)
-                print(f"{i:<4} {pos[0]:<14.6f} {pos[1]:<14.6f} {dist:<12.2f} {speed:<10.2f}")
-            else:
-                print(f"{i:<4} {'N/A':<14} {'N/A':<14} {'N/A':<12} {'N/A':<10}")
-    
-    def run(self, iterations=ITERATION, update_interval=UPDATE_INTERVAL, print_interval=PRINT_INTERVAL, verbose=True):
-        """
-        Run the APF simulation for a specified number of iterations
+                    distances_to_target.append(dist)
+                
+                # Calculate velocity magnitude
+                vx = self.velocities[i]['vx']
+                vy = self.velocities[i]['vy']
+                velocity = math.sqrt(vx**2 + vy**2)
+                velocities.append(velocity)
         
-        Args:
-            iterations: Number of iterations to simulate
-            update_interval: Time between position updates in seconds
-            print_interval: Print state every N iterations (0 to disable)
-            verbose: Whether to print simulation progress
-        """
-        print("Starting APF Drone Swarm Simulation")
-        print(f"Target: ({self.target_pos[0]:.6f}, {self.target_pos[1]:.6f})")
-        print(f"Drones: {len(self.drones)}")
-        print(f"Target Radius: {self.target_radius}m")
-        print(f"Altitude: {self.altitude}m")
+        # Calculate center position
+        if positions:
+            center_lat = sum(p[0] for p in positions) / len(positions)
+            center_lon = sum(p[1] for p in positions) / len(positions)
+        else:
+            center_lat = 0
+            center_lon = 0
         
-        for i in range(iterations):
-            self.update_drone_positions()
-            
-            if verbose and print_interval > 0 and (i + 1) % print_interval == 0:
-                self.print_state(i + 1)
-            
-            time.sleep(update_interval)
+        # Compile statistics
+        stats = {
+            'num_drones': len(self.drones),
+            'positions_available': len(positions),
+            'center_lat': center_lat,
+            'center_lon': center_lon,
+        }
         
-        # Print final state
-        if verbose:
-            print(f"\n{'='*70}")
-            print("SIMULATION COMPLETE")
-            self.print_state(iterations)
+        if distances_to_target:
+            stats['avg_distance_to_target'] = sum(distances_to_target) / len(distances_to_target)
+            stats['min_distance_to_target'] = min(distances_to_target)
+            stats['max_distance_to_target'] = max(distances_to_target)
+        
+        if velocities:
+            stats['avg_velocity'] = sum(velocities) / len(velocities)
+        
+        return stats
     
     def land_all(self):
-        """Command all drones to land"""
+        """Land all drones"""
         for i, drone in enumerate(self.drones):
             if drone.land():
-                logger.success(f"Drone {i} land command sent")
+                logger.success(f"Drone {i} landing")
             else:
                 logger.error(f"Drone {i} land command failed")
     
     def cleanup(self):
-        """Cleanup all drone connections"""
+        """
+        Cleanup all resources before shutdown.
+        
+        FIX 3: Properly stop the server thread and wait for it to finish.
+        """
+        logger.info("Starting cleanup...")
+        
+        # Signal the server thread to stop
+        self._stop_server = True
+        
+        # Wait for server thread to exit (with timeout to prevent hanging)
+        if self.target_server_t and self.target_server_t.is_alive():
+            self.target_server_t.join(timeout=2.0)
+            if self.target_server_t.is_alive():
+                logger.warning("Server thread did not stop cleanly (timeout)")
+            else:
+                logger.info("Server thread stopped cleanly")
+        
+        # Close all drone connections
         for i, drone in enumerate(self.drones):
-            drone.cleanup()
-            logger.info(f"Drone {i} connection closed")
+            try:
+                drone.cleanup()
+                logger.info(f"Drone {i} connection closed")
+            except Exception as e:
+                logger.error(f"Error closing drone {i}: {str(e)}")
+        
+        logger.info("Cleanup complete")
 
 
 class Cli(cmd.Cmd):
@@ -394,14 +529,9 @@ class Cli(cmd.Cmd):
     
     def __init__(self, completekey = "tab", stdin = None, stdout = None):
         super().__init__(completekey, stdin, stdout)
+
         self.swarm = APFDroneSwarm(
-            connection_strings=[
-                "udp:172.21.128.1:14550", 
-                "udp:172.21.128.1:14560",
-                "udp:172.21.128.1:14570",
-                "udp:172.21.128.1:14580",
-                "udp:172.21.128.1:14590",
-                ],
+            connection_strings=os.getenv('DRONE_SWARM').split(', '),
             target_pos=(0.0, 0.0),
             altitude=10.0,
         )
@@ -451,10 +581,12 @@ class Cli(cmd.Cmd):
             # Run for a limited number of iterations to allow user control
             print(f"Flying to target position: ({lat:.6f}, {lon:.6f})")
             print("Starting APF formation control...")
-            self.swarm.run(iterations=ITERATION , update_interval=UPDATE_INTERVAL, print_interval=PRINT_INTERVAL, verbose=True)
+            self.swarm.run(iterations=float('inf'), update_interval=UPDATE_INTERVAL, print_interval=PRINT_INTERVAL, verbose=True)
             
         except ValueError:
             logger.error("Invalid coordinates. Usage: flyto <latitude> <longitude>")
+        except KeyboardInterrupt:
+            print("\nFlight control paused. You can now issue new commands.")
         except Exception as e:
             logger.error(f"Error during flyto: {str(e)}")
 
