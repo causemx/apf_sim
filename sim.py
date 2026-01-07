@@ -13,7 +13,7 @@ import threading
 from control import DroneNode, FlightMode
 from loguru import logger
 from dotenv import load_dotenv
-from util import haversine_distance, calculate_bearing, destination_point
+from util import haversine_distance, calculate_bearing
 
 
 load_dotenv()
@@ -113,7 +113,7 @@ class APFDroneSwarm:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((HOST, PORT))
                 s.listen(1)
-                # FIX 2a: Set timeout on accept() to avoid indefinite blocking
+                # Set timeout on accept() to avoid indefinite blocking
                 s.settimeout(1.0)  # 1 second timeout
                 logger.info(f"Server listening on {HOST}:{PORT}")
                 
@@ -157,7 +157,7 @@ class APFDroneSwarm:
                     if conn:
                         try:
                             conn.close()
-                        except:
+                        except Exception:
                             pass
                             
         except Exception as e:
